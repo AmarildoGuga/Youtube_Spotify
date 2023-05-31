@@ -198,5 +198,5 @@ class CreatePlaylist:
         
 if __name__ == '__main__':
     playlist_url = input("Please input your YouTube playlist URL: ")
-    cp =CreatePlaylist(playlist_url)
+    cp=CreatePlaylist(playlist_url)
     cp.add_song_to_playlist()
