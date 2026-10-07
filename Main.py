@@ -5,7 +5,8 @@ import datetime
 import json
 import time
 from urllib.parse import urlparse, parse_qs
-import yt_dlp as youtube_dl  # maintained fork of youtube_dl, same interface
+import re
+import difflib
 from spotipy.oauth2 import SpotifyOAuth
 import pandas as pd
 
@@ -67,21 +68,58 @@ class CreatePlaylist:
 
         return video_ids
 
+    def clean_title(self, video_title, channel_title="", description=""):
+        """
+        Works out the artist and song name of a video using only what the youtube api gives us.
+        Params:
+
+        video_title: title of the video, eg: "Tinashe - Needs (Official Video)"
+        channel_title: name of the channel that uploaded it
+        description: description of the video
+
+        Returns:
+        (artist, song_name) eg: ("Tinashe", "Needs")
+        """
+        # auto generated "Topic" videos have clean info in the description:
+        # "Provided to YouTube by ...\n\nSong Name · Artist Name · ..."
+        provided = re.search(r"Provided to YouTube by [^\n]*\n+([^\n·]+?) · ([^\n·]+)", description)
+        if provided:
+            return provided.group(2).strip(), provided.group(1).strip()
+
+        title = video_title
+        # throw away everything after a "|" eg: "| A COLORS SHOW"
+        title = title.split("|")[0]
+        # remove brackets that only hold junk words eg: (Official Video) [Lyrics] (4K)
+        junk = r"official|videos?|audio|lyrics?|visuali[sz]er|music|mv|m/v|hd|4k|hq|explicit|clip|full|version"
+        title = re.sub(rf"[\(\[][^\)\]]*\b({junk})\b[^\)\]]*[\)\]]", "", title, flags=re.IGNORECASE)
+        # remove featured artists eg: (feat. X) / ft. X
+        title = re.sub(r"[\(\[]?\b(feat|ft)\b\.?[^\)\]]*[\)\]]?", "", title, flags=re.IGNORECASE)
+        title = re.sub(r"\s+", " ", title).strip(" -–—")
+
+        # "Artist - Song"
+        parts = re.split(r"\s[-–—]\s", title, maxsplit=1)
+        if len(parts) == 2:
+            return parts[0].strip(), parts[1].strip().strip('"')
+
+        # no separator, so the channel name is our best guess for the artist
+        artist = re.sub(r"\s*(- Topic|VEVO)$", "", channel_title, flags=re.IGNORECASE).strip()
+        return artist, title.strip('"')
+
     def get_video_details(self, video_ids):
         """
-        Get video statistics of all videos with given IDs
+        Get the title, channel and description of all videos with given IDs
+        and work out the artist and song name from them.
         Params:
-        
-        youtube: the build object from googleapiclient.discovery
+
         video_ids: list of video IDs
-        
+
         Returns:
-        Dataframe with videos artist and song
+        Nothing, fills self.all_song_info with the artist, song and spotify uri of each video
         """
-        
+
         for i in range(0, len(video_ids), 50):  ##Takes all the videos that are present in the playlist
             request = self.youtube.videos().list(
-                part="snippet,contentDetails,statistics",
+                part="snippet",
                 id = ','.join(video_ids[i:i+50])
             )
             response = request.execute()
@@ -91,31 +129,23 @@ class CreatePlaylist:
                 youtube_url = "https://www.youtube.com/watch?v={}".format(
                     video["id"])
 
-                try:
-                    # use youtube_dl to collect the song name & artist name
-                    video = youtube_dl.YoutubeDL({'quiet': True}).extract_info(youtube_url, download=False)
-                    song_name = video.get("track")
-                    artist = video.get("artist")
-                except Exception as e:
-                    print(f"Error occurred with URL: {youtube_url}")
-                    print(str(e))
-                    continue
+                artist, song_name = self.clean_title(
+                    video_title,
+                    video["snippet"].get("channelTitle", ""),
+                    video["snippet"].get("description", "")
+                )
 
-                # most videos have no track/artist metadata, so fall back to the video title
-                if song_name is None or artist is None:
-                    song_name = video_title
-                    artist = ""
+                spotify_uri, match_name, score = self.search_for_song_uri(song_name, artist)
+                self.all_song_info[video_title] = {
+                    "youtube_url": youtube_url,
+                    "song_name": song_name,
+                    "artist": artist,
 
-                if song_name is not None:
-                    # save all important info and skip any missing song and artist
-                    self.all_song_info[video_title] = {
-                        "youtube_url": youtube_url,
-                        "song_name": song_name,
-                        "artist": artist,
-
-                        # add the uri, easy to get song to put into playlist
-                        "spotify_uri": self.search_for_song_uri(song_name, artist)
-                    }
+                    # add the uri, easy to get song to put into playlist
+                    "spotify_uri": spotify_uri,
+                    "spotify_match": match_name,
+                    "match_score": score
+                }
 
     def get_token(self):
         # client credentials can only read, creating a playlist needs the user to log in once
@@ -138,20 +168,33 @@ class CreatePlaylist:
             "public": True
         })
 
-        query = f"https://api.spotify.com/v1/users/{self.user_id}/playlists"
+        query = "https://api.spotify.com/v1/me/playlists"  # the old /users/{id}/playlists url now returns 403
         response = requests.post(
             query,
             data=request_body,
             headers=self.get_auth_header()   
         )
+        if response.status_code not in (200, 201):
+            raise Exception(f"Could not create the Spotify playlist. Status code: {response.status_code} {response.text}")
         response_json = response.json()
 
         return response_json['id']
 
-    def search_for_song_uri(self, song_name, artist):    
+    def similarity(self, a, b):
+        """How alike two strings are, from 0 (nothing) to 1 (identical), ignoring case and punctuation."""
+        clean = lambda text: re.sub(r"[^a-z0-9 ]", "", text.lower()).strip()
+        return difflib.SequenceMatcher(None, clean(a), clean(b)).ratio()
+
+    def search_for_song_uri(self, song_name, artist, min_score=0.6):
+        """
+        Searches spotify and returns the closest of the top 5 results.
+
+        Returns:
+        (uri, "Song - Artist" that was matched, score) or (None, None, score) if nothing is close enough
+        """
         url = "https://api.spotify.com/v1/search"
         headers = self.get_auth_header()
-        params = {"q": f"{song_name} {artist}".strip(), "type": "track", "limit": 1}
+        params = {"q": f"{song_name} {artist}".strip(), "type": "track", "limit": 5}
 
         # retry if spotify says we are going too fast (429), waiting as long as it asks
         for attempt in range(5):
@@ -165,14 +208,26 @@ class CreatePlaylist:
 
         if result.status_code != 200:
             print(f"Spotify search failed ({result.status_code}) for: {song_name}")
-            return None
+            return None, None, 0
         json_result = result.json().get("tracks", {}).get("items", [])
-        if len(json_result) == 0:
-            print("No artist or song with this name exists...")
-            return None
 
-        uri = json_result[0]["uri"]
-        return uri
+        # score each result on how close the song name and artist are to what we asked for
+        best_track, best_score = None, 0
+        for track in json_result:
+            song_score = self.similarity(song_name, track["name"])
+            if artist:
+                artist_score = max(self.similarity(artist, a["name"]) for a in track["artists"])
+                score = 0.6 * song_score + 0.4 * artist_score
+            else:
+                score = song_score
+            if score > best_score:
+                best_track, best_score = track, score
+
+        if best_track is None or best_score < min_score:
+            return None, None, round(best_score, 2)
+
+        match_name = f"{best_track['name']} - {best_track['artists'][0]['name']}"
+        return best_track["uri"], match_name, round(best_score, 2)
 
     def add_song_to_playlist(self):
         video_ids = self.get_video_ids(self.playlist_id)
@@ -181,13 +236,20 @@ class CreatePlaylist:
         # Get the playlist id from the create_playlist method
         playlist_id = self.create_playlist()
 
+        # show what was matched, so wrong matches are easy to spot
+        for video_title, info in self.all_song_info.items():
+            if info["spotify_uri"] is None:
+                print(f"NOT FOUND: {video_title}  (searched: {info['song_name']} / {info['artist']}, best score {info['match_score']})")
+            else:
+                print(f"{info['match_score']:.2f}  {video_title}  ->  {info['spotify_match']}")
+
         # collect all of uri (skip songs that were not found on spotify)
         uris = [info["spotify_uri"]
                 for song, info in self.all_song_info.items()
                 if info["spotify_uri"] is not None]
 
         # Make the request to the Spotify API (it accepts at most 100 songs at a time)
-        url = f"https://api.spotify.com/v1/playlists/{playlist_id}/tracks"
+        url = f"https://api.spotify.com/v1/playlists/{playlist_id}/items"  # /tracks now returns 403
         headers = self.get_auth_header()
         for i in range(0, len(uris), 100):
             data = json.dumps({"uris": uris[i:i+100]})
