@@ -197,7 +197,10 @@ class CreatePlaylist:
             if response.status_code not in (200, 201):
                 raise Exception(f"Failed to add songs to playlist. Status code: {response.status_code} {response.text}")
 
-        print(f"Successfully added {len(uris)} songs to playlist: {playlist_id}")
+        playlist_link = f"https://open.spotify.com/playlist/{playlist_id}"
+        print(f"Successfully added {len(uris)} songs to your new playlist:")
+        print(playlist_link)
+        return playlist_link
 
 if __name__ == '__main__':
     playlist_url = input("Please input your YouTube playlist URL: ")
