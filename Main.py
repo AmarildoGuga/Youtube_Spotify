@@ -3,6 +3,7 @@ import base64
 import requests
 import datetime
 import json
+import time
 from urllib.parse import urlparse, parse_qs
 import yt_dlp as youtube_dl  # maintained fork of youtube_dl, same interface
 from spotipy.oauth2 import SpotifyOAuth
@@ -152,7 +153,19 @@ class CreatePlaylist:
         headers = self.get_auth_header()
         params = {"q": f"{song_name} {artist}".strip(), "type": "track", "limit": 1}
 
-        result = requests.get(url, headers=headers, params=params)
+        # retry if spotify says we are going too fast (429), waiting as long as it asks
+        for attempt in range(5):
+            result = requests.get(url, headers=headers, params=params)
+            if result.status_code != 429:
+                break
+            wait = int(result.headers.get("Retry-After", 5)) + 1
+            print(f"Spotify rate limit hit, waiting {wait}s...")
+            time.sleep(wait)
+        time.sleep(0.3)  # small pause between searches so we stay under the rate limit
+
+        if result.status_code != 200:
+            print(f"Spotify search failed ({result.status_code}) for: {song_name}")
+            return None
         json_result = result.json().get("tracks", {}).get("items", [])
         if len(json_result) == 0:
             print("No artist or song with this name exists...")
