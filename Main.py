@@ -4,19 +4,21 @@ import requests
 import datetime
 import json
 from urllib.parse import urlparse, parse_qs
-import youtube_dl
+import yt_dlp as youtube_dl  # maintained fork of youtube_dl, same interface
+from spotipy.oauth2 import SpotifyOAuth
 import pandas as pd
 
 
 from googleapiclient.discovery import build
 from dotenv import load_dotenv
 
-load_dotenv('/Users/dodo/Library/CloudStorage/OneDrive-JCWResourcing/Development/Projects/Youtube Project/Youtube_Spoitfy/Youtube_Spotify/.env')
+load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env'))
 
 client_id = os.getenv('clientID')
 client_secret = os.getenv('client_Secret')
 youtube_api_key = os.getenv('youtube_api_key')
 spotify_user_id = os.getenv('username')
+redirect_uri = os.getenv('redirect_uri', 'http://127.0.0.1:8888/callback')
 
 api_service_name = "youtube"
 api_version = "v3"
@@ -90,15 +92,20 @@ class CreatePlaylist:
 
                 try:
                     # use youtube_dl to collect the song name & artist name
-                    video = youtube_dl.YoutubeDL({}).extract_info(youtube_url, download=False)
-                    song_name = video["track"]
-                    artist = video["artist"]
+                    video = youtube_dl.YoutubeDL({'quiet': True}).extract_info(youtube_url, download=False)
+                    song_name = video.get("track")
+                    artist = video.get("artist")
                 except Exception as e:
                     print(f"Error occurred with URL: {youtube_url}")
                     print(str(e))
                     continue
 
-                if song_name is not None and artist is not None:
+                # most videos have no track/artist metadata, so fall back to the video title
+                if song_name is None or artist is None:
+                    song_name = video_title
+                    artist = ""
+
+                if song_name is not None:
                     # save all important info and skip any missing song and artist
                     self.all_song_info[video_title] = {
                         "youtube_url": youtube_url,
@@ -110,34 +117,18 @@ class CreatePlaylist:
                     }
 
     def get_token(self):
-        auth_string = f"{client_id}:{client_secret}"
-        auth_bytes = auth_string.encode("utf-8")
-        auth_base64 = str(base64.b64encode(auth_bytes), "utf-8")
-
-        url = 'https://accounts.spotify.com/api/token'
-        token_data = {
-            "grant_type": "client_credentials"
-        }
-        token_headers = {
-            "Authorization": f"Basic {auth_base64}",
-            "Content-Type": "application/x-www-form-urlencoded"
-        }
-
-        result = requests.post(url, headers=token_headers, data=token_data)
-        valid_request = result.status_code in range(200, 299)
-
-        if valid_request:
-            now = datetime.datetime.now()
-            token_response_data = result.json()
-            access_token = token_response_data['access_token']
-            expires_in = token_response_data['expires_in']
-            expires = now + datetime.timedelta(seconds=expires_in)
-            return access_token
-        else:
-            raise TypeError('Oops, token not working')
+        # client credentials can only read, creating a playlist needs the user to log in once
+        # (a browser window opens the first time, afterwards the token is cached in .cache)
+        auth_manager = SpotifyOAuth(
+            client_id=client_id,
+            client_secret=client_secret,
+            redirect_uri=redirect_uri,
+            scope="playlist-modify-public playlist-modify-private"
+        )
+        return auth_manager.get_access_token(as_dict=False)
 
     def get_auth_header(self):
-        return {"Authorization": "Bearer " + self.token}
+        return {"Authorization": "Bearer " + self.token, "Content-Type": "application/json"}
 
     def create_playlist(self):
         request_body = json.dumps({
@@ -159,11 +150,10 @@ class CreatePlaylist:
     def search_for_song_uri(self, song_name, artist):    
         url = "https://api.spotify.com/v1/search"
         headers = self.get_auth_header()
-        query = f"?q=track%3a{song_name}+artist%3A{artist}&type=artist%2Ctrack"
-        query_url = url + query
+        params = {"q": f"{song_name} {artist}".strip(), "type": "track", "limit": 1}
 
-        result = requests.get(query_url, headers=headers)
-        json_result = json.loads(result.content)["tracks"]["items"]
+        result = requests.get(url, headers=headers, params=params)
+        json_result = result.json().get("tracks", {}).get("items", [])
         if len(json_result) == 0:
             print("No artist or song with this name exists...")
             return None
@@ -178,24 +168,24 @@ class CreatePlaylist:
         # Get the playlist id from the create_playlist method
         playlist_id = self.create_playlist()
 
-        # collect all of uri
+        # collect all of uri (skip songs that were not found on spotify)
         uris = [info["spotify_uri"]
-                for song, info in self.all_song_info.items()]
-        
-        # Make the request to the Spotify API
+                for song, info in self.all_song_info.items()
+                if info["spotify_uri"] is not None]
+
+        # Make the request to the Spotify API (it accepts at most 100 songs at a time)
         url = f"https://api.spotify.com/v1/playlists/{playlist_id}/tracks"
         headers = self.get_auth_header()
-        data = json.dumps({"uris": song_uris})
-        response = requests.post(url, headers=headers, data=data)
+        for i in range(0, len(uris), 100):
+            data = json.dumps({"uris": uris[i:i+100]})
+            response = requests.post(url, headers=headers, data=data)
 
-        # check for valid response status
-        if response.status_code != 200:
-            raise Exception(f"Failed to add songs to playlist. Status code: {response.status_code}")
+            # check for valid response status (spotify answers 201 when songs are added)
+            if response.status_code not in (200, 201):
+                raise Exception(f"Failed to add songs to playlist. Status code: {response.status_code} {response.text}")
 
-        response_json = response.json()
-        print(f"Successfully added songs to playlist: {playlist_id}")
-        return response_json
-        
+        print(f"Successfully added {len(uris)} songs to playlist: {playlist_id}")
+
 if __name__ == '__main__':
     playlist_url = input("Please input your YouTube playlist URL: ")
     cp=CreatePlaylist(playlist_url)

@@ -1,0 +1,6 @@
+yt-dlp
+spotipy
+requests
+pandas
+python-dotenv
+google-api-python-client
